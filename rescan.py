@@ -14,7 +14,7 @@ import discord
 from discord import Webhook, Embed, Color
 import asyncio
 import aiohttp
-import subprocess # <- ADDED: For running the FFprobe command
+import subprocess 
 
 # === CONFIG ===
 
@@ -71,7 +71,9 @@ class RunStats:
         self.warnings = []
         self.total_scanned = 0
         self.total_missing = 0
-        self.broken_symlinks = 0
+        self.broken_links = 0       # Renamed and initialized
+        self.corrupt_media = 0      # ADDED: New counter for FFprobe failures
+        self.ffprobe_missing = False # Added flag for FFprobe environment error
 
     def add_missing_item(self, library_name, file_path):
         self.missing_items[library_name].append(file_path)
@@ -85,9 +87,15 @@ class RunStats:
 
     def increment_scanned(self):
         self.total_scanned += 1
+        
+    def increment_broken_links(self): # New method
+        self.broken_links += 1
 
-    def increment_broken_symlinks(self):
-        self.broken_symlinks += 1
+    def increment_corrupt_media(self): # New method
+        self.corrupt_media += 1
+        
+    def set_ffprobe_missing(self): # New method
+        self.ffprobe_missing = True
 
     def get_run_time(self):
         return datetime.now() - self.start_time
@@ -120,11 +128,24 @@ class RunStats:
                     inline=False
                 )
 
-                # Add broken symlinks summary if any
-                if self.broken_symlinks > 0:
+                # Add specific issue breakdown
+                issue_summary = []
+                if self.broken_links > 0:
+                    issue_summary.append(f"Broken Symlinks (Target Missing): **{self.broken_links}**")
+                if self.corrupt_media > 0:
+                    issue_summary.append(f"Corrupt/Unreadable Media (FFprobe Failed): **{self.corrupt_media}**")
+                
+                if issue_summary:
                     embed.add_field(
-                        name="⚠️ Issues",
-                        value=f"Broken Symlinks Skipped: **{self.broken_symlinks}**",
+                        name="⚠️ Symlink/Media Issues",
+                        value="\n".join(issue_summary),
+                        inline=False
+                    )
+                
+                if self.ffprobe_missing:
+                     embed.add_field(
+                        name="⚠️ Setup Warning",
+                        value="FFprobe not found. Media validity check disabled.",
                         inline=False
                     )
 
@@ -140,10 +161,18 @@ class RunStats:
                 if self.errors or self.warnings:
                     error_text = "\n".join([f"❌ {e}" for e in self.errors])
                     warning_text = "\n".join([f"⚠️ {w}" for w in self.warnings])
-                    if error_text or warning_text:
+                    
+                    # Combine warnings/errors if they exist
+                    combined_issues = []
+                    if error_text:
+                        combined_issues.append(error_text)
+                    if warning_text:
+                        combined_issues.append(warning_text)
+
+                    if combined_issues:
                         embed.add_field(
-                            name="⚠️ Other Issues",
-                            value=f"{error_text}\n{warning_text}",
+                            name="⚠️ Other Errors & Warnings",
+                            value="\n".join(combined_issues),
                             inline=False
                         )
 
@@ -161,44 +190,34 @@ class RunStats:
 
 async def send_discord_webhook(webhook, embed):
     """Send a Discord webhook message."""
+    # (Function body remains the same as previous versions)
     try:
-        # Check if embed exceeds Discord's limits
         if len(str(embed)) > 6000:
-            # Split into multiple embeds
             base_embed = Embed(
                 title=embed.title,
                 color=embed.color,
                 timestamp=embed.timestamp
             )
-            
-            # Add overview field
             if embed.fields and embed.fields[0].name == "📊 Overview":
                 base_embed.add_field(
                     name=embed.fields[0].name,
                     value=embed.fields[0].value,
                     inline=False
                 )
-            
-            # Send base embed
             await webhook.send(
                 embed=base_embed,
                 avatar_url=DISCORD_AVATAR_URL,
                 username=DISCORD_WEBHOOK_NAME,
                 wait=True
             )
-            
-            # Create additional embeds for libraries
             current_embed = Embed(
                 title="📁 Library Details",
                 color=embed.color,
                 timestamp=embed.timestamp
             )
-            
-            # Add library fields
             for field in embed.fields[1:]:
-                if field.name.startswith("📁"):
+                if field.name.startswith("📁") or field.name.startswith("⚠️"):
                     if len(str(current_embed)) + len(str(field)) > 6000:
-                        # Send current embed and create new one
                         await webhook.send(
                             embed=current_embed,
                             avatar_url=DISCORD_AVATAR_URL,
@@ -215,8 +234,6 @@ async def send_discord_webhook(webhook, embed):
                         value=field.value,
                         inline=field.inline
                     )
-            
-            # Send final library embed if it has fields
             if current_embed.fields:
                 await webhook.send(
                     embed=current_embed,
@@ -224,27 +241,7 @@ async def send_discord_webhook(webhook, embed):
                     username=DISCORD_WEBHOOK_NAME,
                     wait=True
                 )
-            
-            # Send issues in separate embed if they exist
-            if embed.fields and embed.fields[-1].name == "⚠️ Issues":
-                issues_embed = Embed(
-                    title="⚠️ Issues",
-                    color=Color.red(),
-                    timestamp=embed.timestamp
-                )
-                issues_embed.add_field(
-                    name=embed.fields[-1].name,
-                    value=embed.fields[-1].value,
-                    inline=False
-                )
-                await webhook.send(
-                    embed=issues_embed,
-                    avatar_url=DISCORD_AVATAR_URL,
-                    username=DISCORD_WEBHOOK_NAME,
-                    wait=True
-                )
         else:
-            # Send single embed if within limits
             await webhook.send(
                 embed=embed,
                 avatar_url=DISCORD_AVATAR_URL,
@@ -276,37 +273,31 @@ def get_library_ids():
 
 def get_library_id_for_path(file_path):
     """Get the library section ID for a given file path."""
-    # Get all library sections
+    # (Function body remains the same as previous versions)
     url = f"{PLEX_URL}/library/sections"
     params = {'X-Plex-Token': TOKEN}
     response = requests.get(url, params=params)
     response.raise_for_status()
     root = ET.fromstring(response.content)
     
-    # Find matching sections
     matching_sections = []
     for section in root.findall('Directory'):
         section_type = section.get('type')
         section_id = section.get('key')
         section_title = section.get('title')
         
-        # Get all locations for this section
         for location in section.findall('Location'):
             location_path = location.get('path')
             matching_sections.append((section_id, section_type, location_path, section_title))
     
-    # Find best matching section (prefer more specific matches)
     best_match = None
     best_match_length = 0
     
     for section_id, section_type, location_path, section_title in matching_sections:
-        # Normalize paths for comparison
         normalized_scan_path = os.path.normpath(file_path)
         normalized_location = os.path.normpath(location_path)
         
-        # Check if the file path starts with the library location
         if normalized_scan_path.startswith(normalized_location):
-            # Use the longest matching path (most specific)
             if len(normalized_location) > best_match_length:
                 best_match = (section_id, section_title)
                 best_match_length = len(normalized_location)
@@ -321,9 +312,10 @@ def get_library_id_for_path(file_path):
 
 def cache_library_files(library_id):
     """Cache all files in a library section."""
+    # (Function body remains the same as previous versions)
     if library_id in library_files:
         logger.debug(f"Using cached files for library {BOLD}{library_id}{RESET}...")
-        return  # Already cached
+        return
     
     try:
         section = plex.library.sectionByID(int(library_id))
@@ -331,7 +323,6 @@ def cache_library_files(library_id):
         cache_start = time.time()
         
         if section.type == 'show':
-            # For TV shows, get all episodes
             for show in section.all():
                 for episode in show.episodes():
                     for media in episode.media:
@@ -339,7 +330,6 @@ def cache_library_files(library_id):
                             if part.file:
                                 library_files[library_id].add(part.file)
         else:
-            # For movies, get all items
             for item in section.all():
                 for media in item.media:
                     for part in media.parts:
@@ -350,21 +340,18 @@ def cache_library_files(library_id):
         logger.info(f"💾 Cache initialized for library {BOLD}{section.title}{RESET}: {BOLD}{len(library_files[library_id])}{RESET} files in {BOLD}{cache_time:.2f}{RESET} seconds")
     except Exception as e:
         logger.error(f"Error caching library {library_id}: {str(e)}")
-        # Clear the cache for this library if there was an error
         if library_id in library_files:
             del library_files[library_id]
 
 def is_in_plex(file_path):
     """Check if a file exists in Plex by searching in the appropriate library section."""
-    # Get the library ID for this path
+    # (Function body remains the same as previous versions)
     library_id, library_title = get_library_id_for_path(file_path)
     if not library_id:
         return False
 
-    # Cache library files if not already cached
     cache_library_files(library_id)
     
-    # Check if file exists in cached paths using exact matching
     is_found = file_path in library_files[library_id]
     if is_found:
         logger.debug(f"Found in cache: {BOLD}{file_path}{RESET}")
@@ -372,7 +359,7 @@ def is_in_plex(file_path):
 
 def scan_folder(library_id, folder_path):
     """Trigger a library scan for a specific folder."""
-    # Ensure library_id is a string
+    # (Function body remains the same as previous versions)
     library_id = str(library_id)
     encoded_path = quote(folder_path)
     url = f"{PLEX_URL}/library/sections/{library_id}/refresh?path={encoded_path}&X-Plex-Token={TOKEN}"
@@ -380,63 +367,60 @@ def scan_folder(library_id, folder_path):
     response = requests.get(url)
     logger.info(f"🔎 Scan triggered for: {BOLD}{folder_path}{RESET}")
     logger.info(f"⏳ Waiting {BOLD}{SCAN_INTERVAL}{RESET} seconds before next scan")
-    time.sleep(SCAN_INTERVAL)  # Wait between scans
+    time.sleep(SCAN_INTERVAL)
 
 # --- MODIFIED FUNCTION ---
-def is_broken_symlink(file_path):
+def is_broken_symlink(file_path, stats_obj):
     """
-    Check if a file is a symlink and confirm it's broken using both
-    os.path checks and an FFprobe read attempt.
+    Check if a file is a symlink and confirm its validity.
+    Returns:
+    0: Not a symlink / Valid
+    1: Target Missing (Truly Broken Link)
+    2: Corrupt/Unreadable (FFprobe Failed)
+    3: FFprobe Missing (Warning/Skipped)
     """
     if not os.path.islink(file_path):
-        return False
+        return 0
     
-    # Fast Check 1: Does the target path exist? (Original method)
+    # 1. Fast Check: Does the target path exist?
     target_exists = os.path.exists(os.path.realpath(file_path))
     
     if not target_exists:
-        # It's a symlink, and its target is missing -> It's broken.
-        logger.debug(f"Fast check failed (target missing): {file_path}")
-        return True
+        return 1 # Truly Broken Link
     
-    # Slow Confirmation Check: Only run if target exists, to check file validity.
-    logger.debug(f"🔍 Confirming symlink target validity with FFprobe: {file_path}")
+    # 2. Slow Confirmation Check: Target exists, run FFprobe for validity.
     
-    # FFprobe command to read the format metadata of the file
     command = [
         'ffprobe',
-        '-v', 'error',          # Suppress detailed output, only show errors
-        '-show_entries', 'format=duration', # Only ask for duration metadata
-        '-of', 'default=noprint_wrappers=1:nokey=1', # Simple output format
+        '-v', 'error',
+        '-show_entries', 'format=duration',
+        '-of', 'default=noprint_wrappers=1:nokey=1',
         file_path
     ]
     
     try:
-        # Run the command and capture output/errors
         result = subprocess.run(
             command,
-            check=False,        # Do not raise an exception on non-zero exit code
+            check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True
         )
         
-        # If the return code is non-zero, FFprobe failed to read the file
         if result.returncode != 0:
-            logger.warning(f"❌ FFprobe failed to read file (Corrupt/Unreadable): {file_path}")
-            # If the target exists but FFprobe fails, we treat it as functionally broken media
-            return True 
+            return 2 # Corrupt/Unreadable
             
     except FileNotFoundError:
-        # This handles the case where 'ffprobe' is not installed or not in PATH
-        # Since the fast check passed (target_exists is True), we assume it's good
-        logger.error("FFprobe not found. Cannot perform media validity check. Check skipped.")
-        return False 
+        # Use a global flag/stats object to track this once per run
+        if not stats_obj.ffprobe_missing:
+            logger.error("FFprobe not found. Media validity check disabled. (Run once per scan)")
+            stats_obj.set_ffprobe_missing()
+        return 3 # FFprobe Missing (Fall back to basic existence check)
     except Exception as e:
         logger.error(f"Error running FFprobe on {file_path}: {str(e)}")
-        return True # Assume broken on unexpected error
-
-    return False # Symlink target exists and FFprobe successfully read it
+        return 2 # Treat unexpected error as corrupt
+        
+    return 0 # Symlink is valid and media is readable
 # ---------------------------
 
 def run_scan():
@@ -480,12 +464,25 @@ def run_scan():
 
                 file_path = os.path.join(root, file)
                 
-                # Check for broken symlinks if enabled
-                if SYMLINK_CHECK and is_broken_symlink(file_path):
-                    warning_msg = f"⏩ Skipping broken symlink/invalid media: {file_path}"
-                    logger.warning(warning_msg)
-                    stats.increment_broken_symlinks()
-                    continue
+                # Check for broken symlinks/corrupt media if enabled
+                if SYMLINK_CHECK:
+                    symlink_status = is_broken_symlink(file_path, stats)
+                    
+                    if symlink_status == 1:
+                        # Case 1: Truly Broken Link (Target Missing)
+                        logger.warning(f"⏩ Skipping Broken Symlink (Target Missing): {file_path}")
+                        stats.increment_broken_links()
+                        continue
+                        
+                    elif symlink_status == 2:
+                        # Case 2: Corrupt/Unreadable Media (FFprobe Failed)
+                        logger.warning(f"⏩ Skipping Corrupt Media (FFprobe Failed): {file_path}")
+                        stats.increment_corrupt_media()
+                        continue
+                        
+                    # symlink_status == 3 (FFprobe Missing) is logged inside the function, 
+                    # and the file is processed as a regular existence check.
+                    # symlink_status == 0 means valid, so processing continues.
 
                 stats.increment_scanned()
 
