@@ -14,6 +14,7 @@ import discord
 from discord import Webhook, Embed, Color
 import asyncio
 import aiohttp
+import subprocess # <- ADDED: For running the FFprobe command
 
 # === CONFIG ===
 
@@ -381,11 +382,62 @@ def scan_folder(library_id, folder_path):
     logger.info(f"⏳ Waiting {BOLD}{SCAN_INTERVAL}{RESET} seconds before next scan")
     time.sleep(SCAN_INTERVAL)  # Wait between scans
 
+# --- MODIFIED FUNCTION ---
 def is_broken_symlink(file_path):
-    """Check if a file is a broken symlink."""
+    """
+    Check if a file is a symlink and confirm it's broken using both
+    os.path checks and an FFprobe read attempt.
+    """
     if not os.path.islink(file_path):
         return False
-    return not os.path.exists(os.path.realpath(file_path))
+    
+    # Fast Check 1: Does the target path exist? (Original method)
+    target_exists = os.path.exists(os.path.realpath(file_path))
+    
+    if not target_exists:
+        # It's a symlink, and its target is missing -> It's broken.
+        logger.debug(f"Fast check failed (target missing): {file_path}")
+        return True
+    
+    # Slow Confirmation Check: Only run if target exists, to check file validity.
+    logger.debug(f"🔍 Confirming symlink target validity with FFprobe: {file_path}")
+    
+    # FFprobe command to read the format metadata of the file
+    command = [
+        'ffprobe',
+        '-v', 'error',          # Suppress detailed output, only show errors
+        '-show_entries', 'format=duration', # Only ask for duration metadata
+        '-of', 'default=noprint_wrappers=1:nokey=1', # Simple output format
+        file_path
+    ]
+    
+    try:
+        # Run the command and capture output/errors
+        result = subprocess.run(
+            command,
+            check=False,        # Do not raise an exception on non-zero exit code
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        
+        # If the return code is non-zero, FFprobe failed to read the file
+        if result.returncode != 0:
+            logger.warning(f"❌ FFprobe failed to read file (Corrupt/Unreadable): {file_path}")
+            # If the target exists but FFprobe fails, we treat it as functionally broken media
+            return True 
+            
+    except FileNotFoundError:
+        # This handles the case where 'ffprobe' is not installed or not in PATH
+        # Since the fast check passed (target_exists is True), we assume it's good
+        logger.error("FFprobe not found. Cannot perform media validity check. Check skipped.")
+        return False 
+    except Exception as e:
+        logger.error(f"Error running FFprobe on {file_path}: {str(e)}")
+        return True # Assume broken on unexpected error
+
+    return False # Symlink target exists and FFprobe successfully read it
+# ---------------------------
 
 def run_scan():
     """Main scan logic."""
@@ -430,7 +482,7 @@ def run_scan():
                 
                 # Check for broken symlinks if enabled
                 if SYMLINK_CHECK and is_broken_symlink(file_path):
-                    warning_msg = f"⏩ Skipping broken symlink: {file_path}"
+                    warning_msg = f"⏩ Skipping broken symlink/invalid media: {file_path}"
                     logger.warning(warning_msg)
                     stats.increment_broken_symlinks()
                     continue
