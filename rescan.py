@@ -71,9 +71,9 @@ class RunStats:
         self.warnings = []
         self.total_scanned = 0
         self.total_missing = 0
-        self.broken_links = 0       # Renamed and initialized
-        self.corrupt_media = 0      # ADDED: New counter for FFprobe failures
-        self.ffprobe_missing = False # Added flag for FFprobe environment error
+        self.broken_links = 0
+        self.corrupt_media = 0
+        self.ffprobe_missing = False
 
     def add_missing_item(self, library_name, file_path):
         self.missing_items[library_name].append(file_path)
@@ -88,13 +88,13 @@ class RunStats:
     def increment_scanned(self):
         self.total_scanned += 1
         
-    def increment_broken_links(self): # New method
+    def increment_broken_links(self):
         self.broken_links += 1
 
-    def increment_corrupt_media(self): # New method
+    def increment_corrupt_media(self):
         self.corrupt_media += 1
         
-    def set_ffprobe_missing(self): # New method
+    def set_ffprobe_missing(self):
         self.ffprobe_missing = True
 
     def get_run_time(self):
@@ -257,6 +257,7 @@ async def send_discord_webhook(webhook, embed):
 
 def get_library_ids():
     """Fetch library section IDs and paths dynamically from Plex."""
+    # (Function body remains the same as previous versions)
     global library_ids, library_paths
     for section in plex.library.sections():
         lib_type = section.type
@@ -264,7 +265,6 @@ def get_library_ids():
         lib_title = section.title
         library_ids[lib_type] = lib_key
         
-        # Get the path for this library
         for location in section.locations:
             library_paths[location] = lib_key
             logger.debug(f"Found library '{lib_title}' (ID: {lib_key}) at path: {location}")
@@ -369,7 +369,6 @@ def scan_folder(library_id, folder_path):
     logger.info(f"⏳ Waiting {BOLD}{SCAN_INTERVAL}{RESET} seconds before next scan")
     time.sleep(SCAN_INTERVAL)
 
-# --- MODIFIED FUNCTION ---
 def is_broken_symlink(file_path, stats_obj):
     """
     Check if a file is a symlink and confirm its validity.
@@ -411,8 +410,8 @@ def is_broken_symlink(file_path, stats_obj):
             return 2 # Corrupt/Unreadable
             
     except FileNotFoundError:
-        # Use a global flag/stats object to track this once per run
         if not stats_obj.ffprobe_missing:
+            # Log the error only once per scan run
             logger.error("FFprobe not found. Media validity check disabled. (Run once per scan)")
             stats_obj.set_ffprobe_missing()
         return 3 # FFprobe Missing (Fall back to basic existence check)
@@ -421,7 +420,6 @@ def is_broken_symlink(file_path, stats_obj):
         return 2 # Treat unexpected error as corrupt
         
     return 0 # Symlink is valid and media is readable
-# ---------------------------
 
 def run_scan():
     """Main scan logic."""
@@ -470,19 +468,24 @@ def run_scan():
                     
                     if symlink_status == 1:
                         # Case 1: Truly Broken Link (Target Missing)
-                        logger.warning(f"⏩ Skipping Broken Symlink (Target Missing): {file_path}")
+                        target_path = os.path.realpath(file_path)
+                        logger.warning(
+                            f"⏩ Skipping BROKEN SYMLINK (Target Missing). Delete link: {BOLD}{file_path}{RESET} "
+                            f"(Target: {target_path})"
+                        )
                         stats.increment_broken_links()
                         continue
                         
                     elif symlink_status == 2:
                         # Case 2: Corrupt/Unreadable Media (FFprobe Failed)
-                        logger.warning(f"⏩ Skipping Corrupt Media (FFprobe Failed): {file_path}")
+                        logger.warning(
+                            f"⏩ Skipping CORRUPT MEDIA (FFprobe Failed). Check file: {BOLD}{file_path}{RESET}"
+                        )
                         stats.increment_corrupt_media()
                         continue
                         
-                    # symlink_status == 3 (FFprobe Missing) is logged inside the function, 
-                    # and the file is processed as a regular existence check.
-                    # symlink_status == 0 means valid, so processing continues.
+                    # Status 3 (FFprobe Missing) means we continue as normal
+                    # Status 0 (Valid) means we continue as normal
 
                 stats.increment_scanned()
 
