@@ -33,6 +33,8 @@ DISCORD_WEBHOOK_NAME = "Rescan"
 SYMLINK_CHECK = config.getboolean('behaviour', 'symlink_check', fallback=False)
 DELETE_BROKEN = config.getboolean('behaviour', 'delete_broken', fallback=False)
 ENABLE_BLOCKLIST = config.getboolean('behaviour', 'enable_blocklist', fallback=True)
+ENABLE_RESCAN = config.getboolean('behaviour', 'enable_rescan', fallback=True)
+ENABLE_SEARCH = config.getboolean('behaviour', 'enable_search', fallback=True)
 NOTIFICATIONS_ENABLED = config.getboolean('notifications', 'enabled', fallback=True)
 
 directories_raw = config['scan']['directories']
@@ -110,6 +112,63 @@ def load_arr_instances():
                     logger.error(f"❌ Error loading Radarr {key}: {e}")
     
     return sonarr_instances, radarr_instances
+
+def test_arr_connection(url, api_key, service_name):
+    """Test connection to Sonarr/Radarr instance."""
+    try:
+        # Test with /system/status endpoint
+        result = api_request(url, api_key, "system/status")
+        if result:
+            version = result.get('version', 'Unknown')
+            return True, version
+        else:
+            return False, "Invalid API key or unreachable"
+    except Exception as e:
+        return False, str(e)
+
+def validate_arr_instances():
+    """Validate all Sonarr/Radarr instances on startup."""
+    all_valid = True
+    
+    logger.info(f"\n{BOLD}Testing Sonarr/Radarr Connections...{RESET}")
+    
+    for instance in SONARR_INSTANCES:
+        name = instance.get('name', 'Unknown')
+        url = instance.get('url', '')
+        api_key = instance.get('api_key', '')
+        
+        logger.info(f"Testing Sonarr: {BOLD}{name}{RESET} at {url}...")
+        success, message = test_arr_connection(url, api_key, 'Sonarr')
+        
+        if success:
+            logger.info(f"{GREEN}✅ Connected successfully (v{message}){RESET}")
+        else:
+            logger.error(f"{RED}❌ Connection failed: {message}{RESET}")
+            all_valid = False
+    
+    for instance in RADARR_INSTANCES:
+        name = instance.get('name', 'Unknown')
+        url = instance.get('url', '')
+        api_key = instance.get('api_key', '')
+        
+        logger.info(f"Testing Radarr: {BOLD}{name}{RESET} at {url}...")
+        success, message = test_arr_connection(url, api_key, 'Radarr')
+        
+        if success:
+            logger.info(f"{GREEN}✅ Connected successfully (v{message}){RESET}")
+        else:
+            logger.error(f"{RED}❌ Connection failed: {message}{RESET}")
+            all_valid = False
+    
+    if not all_valid:
+        logger.warning(f"\n")
+        logger.warning(f"{YELLOW}⚠️  Some instances failed validation. Check your API keys and URLs.{RESET}")
+    else:
+        logger.info(f"\n")
+        logger.info(f"{GREEN}✅ All instances validated successfully!{RESET}")
+    
+    logger.info("")
+    return all_valid
 
 SONARR_INSTANCES, RADARR_INSTANCES = load_arr_instances()
 
@@ -192,7 +251,7 @@ def find_sonarr_instance(filepath):
             return instance
     return None
 
-def trigger_radarr_fix(filepath, instance, do_blocklist=True):
+def trigger_radarr_fix(filepath, instance, do_blocklist=True, do_rescan=True, do_search=True):
     url = instance['url']
     api_key = instance['api_key']
     local_prefix = instance.get('local_path_prefix', '')
@@ -208,11 +267,13 @@ def trigger_radarr_fix(filepath, instance, do_blocklist=True):
     target_movie = next((m for m in movies if m['path'] in remote_path), None)
     
     if target_movie:
+        # 1. Blocklist (optional)
         if do_blocklist:
             blocklist_radarr(url, api_key, target_movie['id'])
         else:
             logger.info(f"{YELLOW}Skipping blocklist (disabled in config){RESET}")
 
+        # 2. Delete File
         files = api_request(url, api_key, f"moviefile?movieId={target_movie['id']}")
         if files:
             target_file = next((f for f in files if f['path'] == remote_path), None)
@@ -220,14 +281,27 @@ def trigger_radarr_fix(filepath, instance, do_blocklist=True):
                 logger.info(f"{YELLOW}Deleting file ID {target_file['id']}...{RESET}")
                 api_request(url, api_key, f"moviefile/{target_file['id']}", method="DELETE")
 
-        logger.info(f"{GREEN}Triggering Search for: {target_movie['title']}{RESET}")
-        api_request(url, api_key, "command", method="POST", 
-                   body={"name": "MoviesSearch", "movieIds": [target_movie['id']]})
+        # 3. Rescan (optional)
+        if do_rescan:
+            logger.info(f"{YELLOW}Triggering Rescan...{RESET}")
+            api_request(url, api_key, "command", method="POST", 
+                       body={"name": "RefreshMovie", "movieIds": [target_movie['id']]})
+        else:
+            logger.info(f"{YELLOW}Skipping rescan (disabled in config){RESET}")
+
+        # 4. Search (optional)
+        if do_search:
+            logger.info(f"{GREEN}Triggering Search for: {target_movie['title']}{RESET}")
+            api_request(url, api_key, "command", method="POST", 
+                       body={"name": "MoviesSearch", "movieIds": [target_movie['id']]})
+        else:
+            logger.info(f"{YELLOW}Skipping search (disabled in config){RESET}")
+        
         return True
     
     return False
 
-def trigger_sonarr_fix(filepath, instance, do_blocklist=True):
+def trigger_sonarr_fix(filepath, instance, do_blocklist=True, do_rescan=True, do_search=True):
     url = instance['url']
     api_key = instance['api_key']
     local_prefix = instance.get('local_path_prefix', '')
@@ -262,22 +336,33 @@ def trigger_sonarr_fix(filepath, instance, do_blocklist=True):
             target_ep = linked_episodes[0]
             logger.info(f"{GREEN}File belongs to: S{target_ep['seasonNumber']}E{target_ep['episodeNumber']} - {target_ep['title']}{RESET}")
             
+            # 1. Blocklist (optional)
             if do_blocklist:
                 blocklist_sonarr(url, api_key, target_ep['id'])
             else:
                 logger.info(f"{YELLOW}Skipping blocklist (disabled in config){RESET}")
             
+            # 2. Delete File
             logger.info(f"{YELLOW}Deleting file ID {file_id}...{RESET}")
             api_request(url, api_key, f"episodefile/{file_id}", method="DELETE")
             
-            logger.info(f"{YELLOW}Rescanning Series...{RESET}")
-            api_request(url, api_key, "command", method="POST", 
-                       body={"name": "RescanSeries", "seriesId": target_series['id']})
+            # 3. Rescan Series (optional)
+            if do_rescan:
+                logger.info(f"{YELLOW}Rescanning Series...{RESET}")
+                api_request(url, api_key, "command", method="POST", 
+                           body={"name": "RescanSeries", "seriesId": target_series['id']})
+            else:
+                logger.info(f"{YELLOW}Skipping rescan (disabled in config){RESET}")
             
-            missing_ep_ids = [ep['id'] for ep in linked_episodes]
-            logger.info(f"{GREEN}Triggering Search for missing episode(s)...{RESET}")
-            api_request(url, api_key, "command", method="POST", 
-                       body={"name": "EpisodeSearch", "episodeIds": missing_ep_ids})
+            # 4. Search Missing Episode (optional)
+            if do_search:
+                missing_ep_ids = [ep['id'] for ep in linked_episodes]
+                logger.info(f"{GREEN}Triggering Search for missing episode(s)...{RESET}")
+                api_request(url, api_key, "command", method="POST", 
+                           body={"name": "EpisodeSearch", "episodeIds": missing_ep_ids})
+            else:
+                logger.info(f"{YELLOW}Skipping search (disabled in config){RESET}")
+            
             return True
             
         else:
@@ -294,7 +379,10 @@ def handle_broken_symlink(file_path, stats):
         radarr_instance = find_radarr_instance(file_path)
         if radarr_instance:
             logger.info(f"{YELLOW}Attempting Radarr fix with instance: {radarr_instance.get('name', 'Unknown')}{RESET}")
-            if trigger_radarr_fix(file_path, radarr_instance, do_blocklist=ENABLE_BLOCKLIST):
+            if trigger_radarr_fix(file_path, radarr_instance, 
+                                 do_blocklist=ENABLE_BLOCKLIST, 
+                                 do_rescan=ENABLE_RESCAN, 
+                                 do_search=ENABLE_SEARCH):
                 if ENABLE_BLOCKLIST:
                     stats.increment_blocklisted()
                 stats.increment_broken_symlinks()
@@ -303,7 +391,10 @@ def handle_broken_symlink(file_path, stats):
         sonarr_instance = find_sonarr_instance(file_path)
         if sonarr_instance:
             logger.info(f"{YELLOW}Attempting Sonarr fix with instance: {sonarr_instance.get('name', 'Unknown')}{RESET}")
-            if trigger_sonarr_fix(file_path, sonarr_instance, do_blocklist=ENABLE_BLOCKLIST):
+            if trigger_sonarr_fix(file_path, sonarr_instance, 
+                                 do_blocklist=ENABLE_BLOCKLIST, 
+                                 do_rescan=ENABLE_RESCAN, 
+                                 do_search=ENABLE_SEARCH):
                 if ENABLE_BLOCKLIST:
                     stats.increment_blocklisted()
                 stats.increment_broken_symlinks()
@@ -585,12 +676,23 @@ def main():
     if SONARR_INSTANCES:
         logger.info(f"📺 Sonarr instances: {BOLD}{len(SONARR_INSTANCES)}{RESET}")
     
+    # Validate Sonarr/Radarr connections
     if RADARR_INSTANCES or SONARR_INSTANCES:
-        status = "ENABLED" if ENABLE_BLOCKLIST else "DISABLED"
+        validate_arr_instances()
+        
+        # Build status message based on enabled features
+        features = []
+        if ENABLE_BLOCKLIST:
+            features.append("Blocklist")
+        features.append("Delete")
+        if ENABLE_RESCAN:
+            features.append("Rescan")
+        if ENABLE_SEARCH:
+            features.append("Search")
+        
+        feature_str = " + ".join(features)
         color = GREEN if ENABLE_BLOCKLIST else YELLOW
-        logger.info(f"{color}Blocklist: {BOLD}{status}{RESET}")
-    
-    logger.info("")
+        logger.info(f"{color}Features: {BOLD}{feature_str}{RESET}\n")
     
     run_scan()
     
